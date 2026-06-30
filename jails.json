@@ -1,0 +1,4 @@
+{
+  "roots": ["src/main.jai", "src/tests.jai", "build.jai"],
+  "build_root": "build.jai"
+}
