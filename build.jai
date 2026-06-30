@@ -215,7 +215,7 @@ make_universal_bundle :: (out_dir: string, x64_dir: string, arm64_dir: string) -
     ok2 := copy_file(tprint("%/libcurl.dylib", x64_dir), tprint("%/libcurl.dylib", macos));
     if !ok1 || !ok2 { print("⚠️  bundle dylib copy failed (sdl=% curl=%)\n", ok1, ok2); exit(1); }
 
-    write_entire_file(tprint("%/Contents/Info.plist", app), tprint(PLIST_FMT, "SquirrelWhisperer"));
+    write_info_plist(app, "SquirrelWhisperer");
     run_command("chmod", "+x", tprint("%/SquirrelWhisperer", macos));
     return app;
 }
@@ -311,6 +311,18 @@ require_env :: (name: string) -> string {
     return v;
 }
 
+// Bundle version written into Info.plist. CI sets SQUIRREL_VERSION from the git tag
+// (e.g. v1.2 -> "1.2"); local builds fall back to a dev default.
+bundle_version :: () -> string {
+    v := get_env("SQUIRREL_VERSION");
+    return ifx v then v else "1.0";
+}
+
+write_info_plist :: (app: string, app_name: string) {
+    ver := bundle_version();
+    write_entire_file(tprint("%/Contents/Info.plist", app), tprint(PLIST_FMT, app_name, ver, ver));
+}
+
 copy_dep_dylib :: (out_dir: string, import_path: [] string, rel: string, dest_name: string) {
     for import_path {
         src := tprint("%/%", it, rel);
@@ -340,8 +352,7 @@ make_app_bundle :: (app_name: string, exe_path: string, out_dir: string) {
         exit(1);
     }
 
-    plist := tprint(PLIST_FMT, app_name);
-    write_entire_file(tprint("%/Contents/Info.plist", app), plist);
+    write_info_plist(app, app_name);
 
     run_command("chmod", "+x", tprint("%/%", macos, app_name));
     codesign_app(app);
@@ -380,7 +391,8 @@ PLIST_FMT :: #string PLIST
     <key>CFBundleExecutable</key>      <string>%</string>
     <key>CFBundleIdentifier</key>      <string>com.arnaud.squirrelwhisperer</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
-    <key>CFBundleShortVersionString</key> <string>1.0</string>
+    <key>CFBundleShortVersionString</key> <string>%</string>
+    <key>CFBundleVersion</key>         <string>%</string>
     <key>LSUIElement</key>             <true/>
     <key>NSHighResolutionCapable</key> <true/>
     <key>NSMicrophoneUsageDescription</key>

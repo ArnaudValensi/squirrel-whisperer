@@ -45,7 +45,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download and extract Jai
         env:
@@ -68,7 +68,7 @@ jobs:
       # The SDL/Curl dylibs already ship universal, so one arch's copies are enough
       # for the package job; we still upload them per-arch for a self-contained run.
       - name: Upload per-arch build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.arch }}
           path: |
@@ -86,7 +86,7 @@ jobs:
       contents: write   # needed to upload to the GitHub Release
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download and extract Jai
         env:
@@ -97,13 +97,13 @@ jobs:
           chmod +x jai/bin/jai-macos
 
       - name: Download Intel (x64) build
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: build-x64
           path: arch-x64
 
       - name: Download Apple Silicon (arm64) build
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: build-arm64
           path: arch-arm64
@@ -136,10 +136,13 @@ jobs:
           SQUIRREL_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
           SQUIRREL_X64_BUILD: ${{ github.workspace }}/arch-x64
           SQUIRREL_ARM64_BUILD: ${{ github.workspace }}/arch-arm64
-        run: jai/bin/jai-macos build.jai - package-universal
+        run: |
+          # Bundle version = the tag without its leading "v" (e.g. v1.2 -> 1.2).
+          export SQUIRREL_VERSION="${GITHUB_REF_NAME#v}"
+          jai/bin/jai-macos build.jai - package-universal
 
       - name: Upload DMG to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: build/SquirrelWhisperer.dmg
