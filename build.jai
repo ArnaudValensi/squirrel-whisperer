@@ -8,6 +8,9 @@
 //   jai build.jai - install       dev build + install into ~/Applications
 //   jai build.jai - install-prod  release build + install (use this for daily use)
 //   jai build.jai - release        prod build, signed + hardened + notarized DMG
+//   jai build.jai - package-universal   merge two per-arch builds into one universal,
+//                                  signed + hardened + notarized DMG (used by CI; reads
+//                                  SQUIRREL_X64_BUILD / SQUIRREL_ARM64_BUILD)
 //
 // Modeled on the oob-jai build conventions.
 
@@ -19,6 +22,8 @@ build :: () {
 
     if array_find(args, "release") {
         release();
+    } else if array_find(args, "package-universal") {
+        package_universal();
     } else if array_find(args, "build-tests") {
         build_target("./src/tests.jai", "tests", is_dev=true, bundle=false);
     } else if array_find(args, "build-prod") {
@@ -113,31 +118,39 @@ replace_in_bundle :: (src: string, dest: string, rel: string) {
 // launch. Requires a Developer ID (notarization rejects ad-hoc / self-signed) and
 // a one-time `xcrun notarytool store-credentials <profile>` set up by the user.
 release :: () {
-    id_c := getenv(temp_c_string("SQUIRREL_SIGN_IDENTITY"));
-    if !id_c {
-        print("\n⚠️  release needs a Developer ID. Set SQUIRREL_SIGN_IDENTITY, e.g.\n");
-        print("    export SQUIRREL_SIGN_IDENTITY=\"Developer ID Application: Your Name (TEAMID)\"\n");
-        exit(1);
-    }
-    id := to_string(id_c);
-    if !begins_with(id, "Developer ID") {
-        print("\n⚠️  notarization requires a 'Developer ID Application' identity; got '%'.\n", id);
-        exit(1);
-    }
+    id := require_signing_identity();
 
-    prof_c := getenv(temp_c_string("SQUIRREL_NOTARY_PROFILE"));
-    profile := ifx prof_c then to_string(prof_c) else "squirrel-notary";
-
-    // 1. Prod build + bundle (IS_DEV off). This also signs the bundle once; we
-    //    re-sign below with the hardened runtime + entitlements that notarization needs.
+    // Prod build + bundle (IS_DEV off). This also signs the bundle once; package_app
+    // re-signs with the hardened runtime + entitlements that notarization needs.
     build_target("./src/main.jai", "SquirrelWhisperer", is_dev=false, bundle=true);
 
-    app := "./build/SquirrelWhisperer.app";
+    package_app("./build/SquirrelWhisperer.app", id);
+}
 
-    // 2. Re-sign for release: hardened runtime + secure timestamp, signed inside-out
-    //    (nested dylibs first, then the bundle with the mic entitlement on the exe).
-    //    Same Developer ID team on every Mach-O => library validation passes; no
-    //    --deep (Apple-deprecated) and no disable-library-validation needed.
+// Merge two per-architecture prod builds (Intel x86_64 + Apple Silicon arm64) into
+// one universal, signed + hardened + notarized DMG. Used by CI, where the matrix
+// builds each arch on its own runner: this fan-in step lipo-merges the executables
+// (the SDL/Curl dylibs already ship universal, so they are copied as-is) and runs
+// the same release packaging as `release`. The two build dirs are passed via
+// SQUIRREL_X64_BUILD / SQUIRREL_ARM64_BUILD, each containing the SquirrelWhisperer
+// executable plus libSDL2.dylib / libcurl.dylib.
+package_universal :: () {
+    id := require_signing_identity();
+
+    x64 := require_env("SQUIRREL_X64_BUILD");
+    arm := require_env("SQUIRREL_ARM64_BUILD");
+
+    make_directory_if_it_does_not_exist("./build");
+    app := make_universal_bundle("./build", x64, arm);
+    package_app(app, id);
+}
+
+// Re-sign an already-laid-out .app for release, then notarize + staple both the app
+// and a DMG built from it. Signed inside-out (nested dylibs first, then the bundle
+// with the mic entitlement on the exe): same Developer ID team on every Mach-O =>
+// library validation passes; no --deep (Apple-deprecated) and no
+// disable-library-validation needed.
+package_app :: (app: string, id: string) {
     ent := "./build/entitlements.plist";
     write_entire_file(ent, ENTITLEMENTS);
     sign_runtime(tprint("%/Contents/MacOS/libSDL2.dylib", app), id, "");
@@ -147,25 +160,64 @@ release :: () {
     vr := run_command("codesign", "--verify", "--strict", "--verbose=2", app);
     if vr.exit_code != 0 { print("\n⚠️  codesign verification failed.\n"); exit(1); }
 
-    // 3. Notarize + staple the .app (zip via ditto, which preserves the bundle).
+    // Notarize + staple the .app (zip via ditto, which preserves the bundle).
     zip := "./build/SquirrelWhisperer.zip";
     run_command("rm", "-f", zip);
     dr := run_command("ditto", "-c", "-k", "--keepParent", app, zip);
     if dr.exit_code != 0 { print("\n⚠️  ditto zip of the app failed.\n"); exit(1); }
-    notarize(zip, profile);
+    notarize(zip);
     staple(app);
 
-    // 4. Build the DMG from the now-stapled app (+ /Applications drag target).
+    // Build the DMG from the now-stapled app (+ /Applications drag target).
     dmg := build_dmg(app);
 
-    // 5. Notarize + staple the DMG itself, then validate the staple.
-    notarize(dmg, profile);
+    // Notarize + staple the DMG itself, then validate the staple.
+    notarize(dmg);
     staple(dmg);
     vd := run_command("xcrun", "stapler", "validate", dmg);
     if vd.exit_code != 0 { print("\n⚠️  stapler validate failed for %.\n", dmg); exit(1); }
 
     print("\n✅ Release ready: %\n", dmg);
     print("   Notarized + stapled (app and DMG). Distribute this DMG.\n");
+}
+
+// A Developer ID is mandatory: ad-hoc and self-signed certs are rejected by notarization.
+require_signing_identity :: () -> string {
+    id := get_env("SQUIRREL_SIGN_IDENTITY");
+    if !id {
+        print("\n⚠️  this needs a Developer ID. Set SQUIRREL_SIGN_IDENTITY, e.g.\n");
+        print("    export SQUIRREL_SIGN_IDENTITY=\"Developer ID Application: Your Name (TEAMID)\"\n");
+        exit(1);
+    }
+    if !begins_with(id, "Developer ID") {
+        print("\n⚠️  notarization requires a 'Developer ID Application' identity; got '%'.\n", id);
+        exit(1);
+    }
+    return id;
+}
+
+// Lay out a universal .app under out_dir from the two per-arch build dirs and return
+// its path (unsigned; package_app signs it). The executable is lipo-merged from the
+// thin per-arch binaries; the dylibs already ship universal so are copied verbatim.
+make_universal_bundle :: (out_dir: string, x64_dir: string, arm64_dir: string) -> string {
+    app   := tprint("%/SquirrelWhisperer.app", out_dir);
+    macos := tprint("%/Contents/MacOS", app);
+    run_command("rm", "-rf", app);            // start from a clean bundle
+    make_directory_if_it_does_not_exist(macos, recursive=true);
+
+    lr := run_command("lipo", "-create",
+                      tprint("%/SquirrelWhisperer", x64_dir),
+                      tprint("%/SquirrelWhisperer", arm64_dir),
+                      "-output", tprint("%/SquirrelWhisperer", macos));
+    if lr.exit_code != 0 { print("\n⚠️  lipo -create of the executable failed.\n"); exit(1); }
+
+    ok1 := copy_file(tprint("%/libSDL2.dylib",  x64_dir), tprint("%/libSDL2.dylib",  macos));
+    ok2 := copy_file(tprint("%/libcurl.dylib", x64_dir), tprint("%/libcurl.dylib", macos));
+    if !ok1 || !ok2 { print("⚠️  bundle dylib copy failed (sdl=% curl=%)\n", ok1, ok2); exit(1); }
+
+    write_entire_file(tprint("%/Contents/Info.plist", app), tprint(PLIST_FMT, "SquirrelWhisperer"));
+    run_command("chmod", "+x", tprint("%/SquirrelWhisperer", macos));
+    return app;
 }
 
 // codesign with the hardened runtime and a secure timestamp (both required for
@@ -184,16 +236,41 @@ sign_runtime :: (path: string, id: string, entitlements: string) {
 }
 
 // Upload to Apple's automated notary service and block until it finishes (minutes).
-notarize :: (path: string, profile: string) {
-    print("\n📤 Notarizing % via Apple (keychain-profile '%')...\n", path, profile);
-    res := run_command("xcrun", "notarytool", "submit", path, "--keychain-profile", profile, "--wait");
+// Two credential sources, in priority order:
+//   1. CI: explicit SQUIRREL_NOTARY_APPLE_ID / _TEAM_ID / _PASSWORD env vars (an
+//      app-specific password), so no keychain profile has to be provisioned.
+//   2. Local: a keychain profile created once with `notarytool store-credentials`
+//      (name from SQUIRREL_NOTARY_PROFILE, default "squirrel-notary").
+notarize :: (path: string) {
+    apple := get_env("SQUIRREL_NOTARY_APPLE_ID");
+    team  := get_env("SQUIRREL_NOTARY_TEAM_ID");
+    pass  := get_env("SQUIRREL_NOTARY_PASSWORD");
+
+    res: Process_Result;
+    if apple && team && pass {
+        print("\n📤 Notarizing % via Apple (Apple ID '%', team '%')...\n", path, apple, team);
+        res = run_command("xcrun", "notarytool", "submit", path,
+                          "--apple-id", apple, "--team-id", team, "--password", pass, "--wait");
+    } else {
+        profile := notary_profile();
+        print("\n📤 Notarizing % via Apple (keychain-profile '%')...\n", path, profile);
+        res = run_command("xcrun", "notarytool", "submit", path, "--keychain-profile", profile, "--wait");
+    }
+
     if res.exit_code != 0 {
+        profile := notary_profile();
         print("\n⚠️  notarization failed for %.\n", path);
-        print("    If credentials are missing, run once:\n");
+        print("    Locally, store credentials once:\n");
         print("      xcrun notarytool store-credentials \"%\" --apple-id <id> --team-id 62HEYVWMQD --password <app-specific-pw>\n", profile);
+        print("    In CI, set SQUIRREL_NOTARY_APPLE_ID / _TEAM_ID / _PASSWORD.\n");
         print("    For rejection details: xcrun notarytool log <submission-id> --keychain-profile \"%\"\n", profile);
         exit(1);
     }
+}
+
+notary_profile :: () -> string {
+    p := get_env("SQUIRREL_NOTARY_PROFILE");
+    return ifx p then p else "squirrel-notary";
 }
 
 staple :: (path: string) {
@@ -220,6 +297,19 @@ build_dmg :: (app: string) -> string {
 
 getenv :: (name: *u8) -> *u8 #foreign LibC "getenv";
 LibC :: #system_library "libc";
+
+// Read an environment variable as a Jai string ("" if unset).
+get_env :: (name: string) -> string {
+    c := getenv(temp_c_string(name));
+    return ifx c then to_string(c) else "";
+}
+
+// Like get_env but a missing/empty value is a hard error (for required CI inputs).
+require_env :: (name: string) -> string {
+    v := get_env(name);
+    if !v { print("\n⚠️  required environment variable % is not set.\n", name); exit(1); }
+    return v;
+}
 
 copy_dep_dylib :: (out_dir: string, import_path: [] string, rel: string, dest_name: string) {
     for import_path {

@@ -1,0 +1,146 @@
+# Builds The Squirrel Whisperer for both macOS architectures and publishes one
+# universal, signed + notarized DMG to the GitHub Release for the pushed v* tag.
+#
+# The Jai compiler is proprietary and must NOT live in this (public) repo. It is
+# fetched at build time from the PRIVATE 'jai-dist' release of ArnaudValensi/oob-jai
+# (see the "Download and extract Jai" steps), authenticated with a fine-grained PAT.
+# When upgrading the compiler, upload the new zip there:
+#   gh release upload jai-dist jai-beta-<ver>.zip --clobber --repo ArnaudValensi/oob-jai
+#
+# Secrets are never exposed to pull requests from forks, and this workflow only runs
+# on v* tag pushes (which require push access), so a public fork cannot read the PAT.
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   JAI_DIST_PAT             fine-grained PAT, oob-jai only, Contents: Read-only
+#   MACOS_SIGN_IDENTITY      e.g. "Developer ID Application: Arnaud Valensi (62HEYVWMQD)"
+#   MACOS_CERT_P12_BASE64    base64 of the exported Developer ID cert + key (.p12)
+#   MACOS_CERT_PASSWORD      password used when exporting that .p12
+#   MACOS_NOTARY_APPLE_ID    Apple ID email used for notarization
+#   MACOS_NOTARY_TEAM_ID     e.g. 62HEYVWMQD
+#   MACOS_NOTARY_PASSWORD    an app-specific password for that Apple ID
+
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  JAI_ZIP: jai-beta-2-014.zip
+
+jobs:
+  # Build the thin per-architecture executables. Jai targets the host CPU, so each
+  # arch must build on its own runner; the package job lipo-merges them.
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-15-intel   # Intel
+            arch: x64
+          - os: macos-15         # Apple Silicon
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download and extract Jai
+        env:
+          GH_TOKEN: ${{ secrets.JAI_DIST_PAT }}
+        run: |
+          gh release download jai-dist --repo ArnaudValensi/oob-jai --pattern "$JAI_ZIP" --output jai.zip
+          unzip -q jai.zip
+
+      - name: Build (prod)
+        run: |
+          chmod +x jai/bin/jai-macos
+          jai/bin/jai-macos build.jai - build-prod
+          ls -la build/
+
+      - name: Build and run unit tests
+        run: |
+          jai/bin/jai-macos build.jai - build-tests
+          ./build/tests
+
+      # The SDL/Curl dylibs already ship universal, so one arch's copies are enough
+      # for the package job; we still upload them per-arch for a self-contained run.
+      - name: Upload per-arch build
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.arch }}
+          path: |
+            build/SquirrelWhisperer
+            build/libSDL2.dylib
+            build/libcurl.dylib
+          retention-days: 1
+
+  # Fan-in: merge the two arch builds into a universal, signed + hardened +
+  # notarized DMG and attach it to the release.
+  package:
+    needs: build
+    runs-on: macos-15
+    permissions:
+      contents: write   # needed to upload to the GitHub Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download and extract Jai
+        env:
+          GH_TOKEN: ${{ secrets.JAI_DIST_PAT }}
+        run: |
+          gh release download jai-dist --repo ArnaudValensi/oob-jai --pattern "$JAI_ZIP" --output jai.zip
+          unzip -q jai.zip
+          chmod +x jai/bin/jai-macos
+
+      - name: Download Intel (x64) build
+        uses: actions/download-artifact@v4
+        with:
+          name: build-x64
+          path: arch-x64
+
+      - name: Download Apple Silicon (arm64) build
+        uses: actions/download-artifact@v4
+        with:
+          name: build-arm64
+          path: arch-arm64
+
+      # Import the Developer ID cert + private key into a throwaway keychain so
+      # codesign can find the identity. The keychain is added to the search list
+      # and unlocked; it is discarded with the runner.
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Keep the login keychain in the search list so default lookups still work.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build universal signed + notarized DMG
+        env:
+          SQUIRREL_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          SQUIRREL_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          SQUIRREL_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          SQUIRREL_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          SQUIRREL_X64_BUILD: ${{ github.workspace }}/arch-x64
+          SQUIRREL_ARM64_BUILD: ${{ github.workspace }}/arch-arm64
+        run: jai/bin/jai-macos build.jai - package-universal
+
+      - name: Upload DMG to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: build/SquirrelWhisperer.dmg
+          fail_on_unmatched_files: true
